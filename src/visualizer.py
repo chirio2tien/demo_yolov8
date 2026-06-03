@@ -1,7 +1,8 @@
 import cv2
+import json
+import time
 import numpy as np
 from abc import ABC, abstractmethod
-
 
 
 class BaseRenderer(ABC):
@@ -40,6 +41,8 @@ class BoundingBoxRenderer(BaseRenderer):
             or len(detection.xyxy) == 0
         ):
             return frame
+
+        
 
         try:
             for idx in range(len(detection.xyxy)):

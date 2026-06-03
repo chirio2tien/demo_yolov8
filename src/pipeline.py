@@ -81,7 +81,7 @@ class WebStreamStep(PipelineStep):
                 threaded=True
             )
         except Exception as e:
-            print(f"❌ Web server error: {e}")
+            print(f" Web server error: {e}")
             self.is_running = False
 
     def generate(self):
@@ -147,7 +147,7 @@ class AIDetectorStep(PipelineStep):
 
 
 class VisualizationStep(PipelineStep):
-    """Bước đồ họa: Vẽ khung Bounding Box và Dashboard thông số lên Frame"""
+    #Vẽ khung Bounding Box và Dashboard thông số lên Frame
     def __init__(self, visualizer):
         self.visualizer = visualizer
 
@@ -160,7 +160,7 @@ class VisualizationStep(PipelineStep):
 
 
 class TelemetryStep(PipelineStep):
-    """Bước đo lường hiệu năng hệ thống (Tính FPS thời gian thực)"""
+    #Tính FPS thời gian thực
     def __init__(self, monitor=None):
         self.monitor = monitor
         self.frame_times = []
@@ -198,15 +198,12 @@ class TelemetryStep(PipelineStep):
 
 
 class DisplayAndSaveStep(PipelineStep):
-    """Bước xuất dữ liệu ra màn hình cục bộ hoặc ghi file (Sử dụng khi có màn hình cứng HDMI)"""
-    def __init__(self, display=True, output_path=None, fps=30, size=(640, 480)):
+    #Bước xuất dữ liệu ra màn hình cục bộ 
+    def __init__(self, display=True, output_path=None, fps=100, size=(640, 480)):
         self.display = display
         self.video_writer = None
         self.has_display = display and os.environ.get('DISPLAY') is not None
         self.frame_count = 0
-        
-        if self.display and not self.has_display:
-            print(" No X11 display detected. Running in headless mode.")
         
         if output_path:
             try:
@@ -216,7 +213,7 @@ class DisplayAndSaveStep(PipelineStep):
                     print(f" Failed to open video writer: {output_path}")
                     self.video_writer = None
                 else:
-                    print(f"📹 Recording to: {output_path}")
+                    print(f" Recording to: {output_path}")
             except Exception as e:
                 print(f" Error initializing video writer: {e}")
                 self.video_writer = None
@@ -251,7 +248,7 @@ class DisplayAndSaveStep(PipelineStep):
 
 
 class VideoPipeline:
-    """Bộ điều phối trung tâm quản lý luồng dữ liệu Camera (Băng chuyền Pipeline)"""
+    # lý luồng dữ liệu Camera 
     def __init__(self):
         self.steps = []
 

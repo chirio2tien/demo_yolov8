@@ -1,6 +1,57 @@
 import cv2
+import json
+import time
 import numpy as np
 from rknnlite.api import RKNNLite
+
+
+def _max_pairwise_iou_xywh(boxes):
+    best = {'iou': 0.0, 'pair': None}
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            x1, y1, w1, h1 = boxes[i]
+            x2, y2, w2, h2 = boxes[j]
+            ix1 = max(x1, x2)
+            iy1 = max(y1, y2)
+            ix2 = min(x1 + w1, x2 + w2)
+            iy2 = min(y1 + h1, y2 + h2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union = w1 * h1 + w2 * h2 - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best['iou']:
+                best = {'iou': round(float(iou), 4), 'pair': [i, j]}
+    return best
+
+
+def _suppress_contained_boxes(xyxy_list, conf_list, contain_ratio=0.7):
+    #xóa hình bé ra khỏi hình lớn
+    if len(xyxy_list) <= 1:
+        return xyxy_list, conf_list
+
+    keep = [True] * len(xyxy_list)
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in xyxy_list]
+
+    for i in range(len(xyxy_list)):
+        for j in range(i + 1, len(xyxy_list)):
+            if not keep[i] or not keep[j]:
+                continue
+            x1 = max(xyxy_list[i][0], xyxy_list[j][0])
+            y1 = max(xyxy_list[i][1], xyxy_list[j][1])
+            x2 = min(xyxy_list[i][2], xyxy_list[j][2])
+            y2 = min(xyxy_list[i][3], xyxy_list[j][3])
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            if areas[i] <= areas[j]:
+                smaller, larger = i, j
+            else:
+                smaller, larger = j, i
+            if areas[smaller] > 0 and inter / areas[smaller] >= contain_ratio:
+                keep[smaller] = False
+
+    return (
+        [xyxy_list[i] for i in range(len(xyxy_list)) if keep[i]],
+        [conf_list[i] for i in range(len(conf_list)) if keep[i]],
+    )
+# #endregion
 
 
 class DetectionResult:
@@ -39,6 +90,7 @@ class RKNNYoloTracker:
         self.iou_thresh = builder.iou
         self.human_class_id = builder.human_class_id
         self.core_mask = builder.core_mask
+        self._dbg_frame = 0
         
         self.rknn = RKNNLite()
         self._initialize_model(builder.model_path)
@@ -52,17 +104,32 @@ class RKNNYoloTracker:
         if self.rknn.init_runtime(core_mask=self.core_mask) != 0:
             raise RuntimeError("Lỗi khởi tạo NPU Runtime!")
         print("Khởi tạo NPU thành công!")
-
-    def process_frame(self, frame):
-        img_h, img_w = frame.shape[:2]
         
+    def process_frame(self, frame):
+        self._dbg_frame += 1
+        img_h, img_w = frame.shape[:2]
+
+        if not hasattr(self, '_sum_pre'):
+            self._sum_pre = self._sum_inf = self._sum_out = 0.0
+        #do input
+        start_input = time.perf_counter()
         img_input, ratio, dw, dh = self._letterbox(frame)
-
         img_expanded = np.expand_dims(img_input, axis=0)
-
+        end_input = time.perf_counter()
+        self._sum_pre += end_input - start_input
+        #========
+        
+        
+        # model xử lý fram
+        start_predict = time.perf_counter()
         outputs = self.rknn.inference(inputs=[img_expanded])
+        end_predict = time.perf_counter()
+        self._sum_inf += end_predict - start_predict
+        #======
 
-        return self._decode_and_filter(
+        # out
+        start_output = time.perf_counter()
+        results = self._decode_and_filter(
             outputs,
             img_w,
             img_h,
@@ -70,6 +137,24 @@ class RKNNYoloTracker:
             dw,
             dh
         )
+        end_output = time.perf_counter()
+        self._sum_out += end_output - start_output
+        #========
+        #30 frame 1 lần
+        if self._dbg_frame % 30 == 0:
+            print(f"\n--- THỐNG KÊ 30 FRAME (Tới frame {self._dbg_frame}) ---")
+            print(f"1. Input   : {(self._sum_pre / 30) * 1000:.2f} ms")
+            print(f"2. init model  : {(self._sum_inf / 30) * 1000:.2f} ms")
+            print(f"3. Output : {(self._sum_out / 30) * 1000:.2f} ms")
+            
+            total = (self._sum_pre + self._sum_inf + self._sum_out) / 30
+            print(f">> TỔNG 1 FRAME : {total * 1000:.2f} ms (~ {1/total:.2f} FPS)")
+            
+            # Reset 
+            self._sum_pre = self._sum_inf = self._sum_out = 0.0
+
+
+        return results
 
     def _decode_and_filter(
         self,
@@ -168,6 +253,8 @@ class RKNNYoloTracker:
                 int(y2 - y1)
             ])
             
+        pre_nms_count = len(final_boxes)
+
         indices = cv2.dnn.NMSBoxes(final_boxes, scores.tolist(), self.conf_thresh, self.iou_thresh)
         
         if len(indices) == 0:
@@ -178,9 +265,16 @@ class RKNNYoloTracker:
             x, y, w, h = final_boxes[i]
             nms_xyxy.append([x, y, x + w, y + h])
             nms_conf.append(scores[i])
+
+        pre_contain_count = len(nms_xyxy)
+        nms_xyxy, nms_conf = _suppress_contained_boxes(nms_xyxy, nms_conf)
+
+        if not nms_xyxy:
+            return DetectionResult(None, None)
+
             
         return DetectionResult(np.array(nms_xyxy), np.array(nms_conf), np.full(len(nms_xyxy), self.human_class_id))
-    def _letterbox(self, img, new_shape=(640, 640)):
+    def _letterbox(self, img, new_shape=(640, 640)):# resize + pad ảnh về 640×640
         h, w = img.shape[:2]
 
         r = min(new_shape[0] / h, new_shape[1] / w)

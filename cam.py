@@ -15,6 +15,7 @@ from src.pipeline import (
 )
 
 from rknnlite.api import RKNNLite
+import time
 
 
 def main():
@@ -24,15 +25,19 @@ def main():
     OUTPUT_PATH = None
     WEB_PORT = 5000
     try:
+        print("init model")
+        t_init_start = time.perf_counter()
 
         detector = (
             RKNNYoloTrackerBuilder()
             .set_model_path(MODEL_PATH)
-            .set_confidence(0.12)
-            .set_iou(0.65)
+            .set_confidence(0.20)
+            .set_iou(0.45)
             .set_core_mask(RKNNLite.NPU_CORE_AUTO)
             .build()
         )
+        t_init_end = time.perf_counter()
+        print(f"[PROFILE] Init Model tốn : {(t_init_end - t_init_start) * 1000:.2f} ms")
 
         visualizer = (
             FrameVisualizer()
@@ -49,7 +54,7 @@ def main():
             .add_step(DisplayAndSaveStep(
                 display=False,
                 output_path=OUTPUT_PATH,
-                fps=30,
+                fps=100,
                 size=(1920, 1080)
             ))
         )
