@@ -1,57 +1,31 @@
 import cv2
-import json
 import time
 import numpy as np
 from rknnlite.api import RKNNLite
 
-
-def _max_pairwise_iou_xywh(boxes):
-    best = {'iou': 0.0, 'pair': None}
-    for i in range(len(boxes)):
-        for j in range(i + 1, len(boxes)):
-            x1, y1, w1, h1 = boxes[i]
-            x2, y2, w2, h2 = boxes[j]
-            ix1 = max(x1, x2)
-            iy1 = max(y1, y2)
-            ix2 = min(x1 + w1, x2 + w2)
-            iy2 = min(y1 + h1, y2 + h2)
-            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            union = w1 * h1 + w2 * h2 - inter
-            iou = inter / union if union > 0 else 0.0
-            if iou > best['iou']:
-                best = {'iou': round(float(iou), 4), 'pair': [i, j]}
-    return best
-
-
+_DEBUG_TIMING = True
+_MODEL_INPUT = 416
 def _suppress_contained_boxes(xyxy_list, conf_list, contain_ratio=0.7):
-    #xóa hình bé ra khỏi hình lớn
-    if len(xyxy_list) <= 1:
+    n = len(xyxy_list)
+    if n <= 1:
         return xyxy_list, conf_list
 
-    keep = [True] * len(xyxy_list)
-    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in xyxy_list]
+    boxes = np.asarray(xyxy_list, dtype=np.float32) 
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
 
-    for i in range(len(xyxy_list)):
-        for j in range(i + 1, len(xyxy_list)):
-            if not keep[i] or not keep[j]:
-                continue
-            x1 = max(xyxy_list[i][0], xyxy_list[j][0])
-            y1 = max(xyxy_list[i][1], xyxy_list[j][1])
-            x2 = min(xyxy_list[i][2], xyxy_list[j][2])
-            y2 = min(xyxy_list[i][3], xyxy_list[j][3])
-            inter = max(0, x2 - x1) * max(0, y2 - y1)
-            if areas[i] <= areas[j]:
-                smaller, larger = i, j
-            else:
-                smaller, larger = j, i
-            if areas[smaller] > 0 and inter / areas[smaller] >= contain_ratio:
-                keep[smaller] = False
+    ix1 = np.maximum(x1[:, None], x1[None, :])
+    iy1 = np.maximum(y1[:, None], y1[None, :])
+    ix2 = np.minimum(x2[:, None], x2[None, :])
+    iy2 = np.minimum(y2[:, None], y2[None, :])
+    inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
 
-    return (
-        [xyxy_list[i] for i in range(len(xyxy_list)) if keep[i]],
-        [conf_list[i] for i in range(len(conf_list)) if keep[i]],
-    )
-# #endregion
+    is_smaller = areas[:, None] <= areas[None, :] * contain_ratio
+    ratio      = inter / (areas[:, None] + 1e-9)
+    contained  = np.any((ratio >= contain_ratio) & is_smaller, axis=1)
+
+    idx = [i for i in range(n) if not contained[i]]
+    return [xyxy_list[i] for i in idx], [conf_list[i] for i in idx]
 
 
 class DetectionResult:
@@ -77,239 +51,206 @@ class DetectionResult:
                 self.id = None
             def __len__(self): return len(self.xyxy.data)
 
-        # Giả lập cấu trúc trả về giống hệt YOLOv8 PyTorch
         if self.xyxy is None or len(self.xyxy) == 0:
             return type('FakeResult', (object,), {'boxes': None})()
-            
         return type('FakeResult', (object,), {'boxes': FakeBoxes(self.xyxy, self.confidence)})()
 
 
 class RKNNYoloTracker:
     def __init__(self, builder):
-        self.conf_thresh = builder.confidence
-        self.iou_thresh = builder.iou
+        self.conf_thresh    = builder.confidence
+        self.iou_thresh     = builder.iou
         self.human_class_id = builder.human_class_id
-        self.core_mask = builder.core_mask
-        self._dbg_frame = 0
-        
+        self.core_mask      = builder.core_mask
+        self.async_mode     = builder.async_mode
+        self._dbg_frame     = 0
+        self._sum_pre = self._sum_inf = self._sum_out = 0.0
+
+        self._canvas     = None
+        self._canvas_src = None 
+
         self.rknn = RKNNLite()
         self._initialize_model(builder.model_path)
-    
+
     def _initialize_model(self, model_path: str):
         print(f"Đang tải RKNN model từ {model_path}...")
         if self.rknn.load_rknn(model_path) != 0:
             raise RuntimeError("Lỗi khi load model RKNN!")
-            
+
         print(f"Đang khởi tạo NPU (Core Mask: {self.core_mask})...")
-        if self.rknn.init_runtime(core_mask=self.core_mask) != 0:
+        if self.rknn.init_runtime(core_mask=self.core_mask,
+                                   async_mode=self.async_mode) != 0:
             raise RuntimeError("Lỗi khởi tạo NPU Runtime!")
         print("Khởi tạo NPU thành công!")
-        
+
     def process_frame(self, frame):
         self._dbg_frame += 1
         img_h, img_w = frame.shape[:2]
 
-        if not hasattr(self, '_sum_pre'):
-            self._sum_pre = self._sum_inf = self._sum_out = 0.0
-        #do input
+        # In độ phân giải nguồn 
+        if self._dbg_frame == 1:
+            print(f"[detector] Độ phân giải nguồn camera: {img_w}x{img_h}")
+
         start_input = time.perf_counter()
         img_input, ratio, dw, dh = self._letterbox(frame)
         img_expanded = np.expand_dims(img_input, axis=0)
         end_input = time.perf_counter()
         self._sum_pre += end_input - start_input
-        #========
-        
-        
-        # model xử lý fram
+
         start_predict = time.perf_counter()
         outputs = self.rknn.inference(inputs=[img_expanded])
         end_predict = time.perf_counter()
         self._sum_inf += end_predict - start_predict
-        #======
 
-        # out
         start_output = time.perf_counter()
-        results = self._decode_and_filter(
-            outputs,
-            img_w,
-            img_h,
-            ratio,
-            dw,
-            dh
-        )
+        results = self._decode_and_filter(outputs, img_w, img_h, ratio, dw, dh)
         end_output = time.perf_counter()
         self._sum_out += end_output - start_output
-        #========
-        #30 frame 1 lần
-        if self._dbg_frame % 30 == 0:
-            print(f"\n--- THỐNG KÊ 30 FRAME (Tới frame {self._dbg_frame}) ---")
-            print(f"1. Input   : {(self._sum_pre / 30) * 1000:.2f} ms")
-            print(f"2. init model  : {(self._sum_inf / 30) * 1000:.2f} ms")
-            print(f"3. Output : {(self._sum_out / 30) * 1000:.2f} ms")
-            
-            total = (self._sum_pre + self._sum_inf + self._sum_out) / 30
-            print(f">> TỔNG 1 FRAME : {total * 1000:.2f} ms (~ {1/total:.2f} FPS)")
-            
-            # Reset 
-            self._sum_pre = self._sum_inf = self._sum_out = 0.0
 
+        if _DEBUG_TIMING and self._dbg_frame % 30 == 0:
+            avg_pre = self._sum_pre / 30 * 1000
+            avg_inf = self._sum_inf / 30 * 1000
+            avg_out = self._sum_out / 30 * 1000
+            total   = avg_pre + avg_inf + avg_out
+            print(
+                f"\n--- THỐNG KÊ 30 FRAME (Tới frame {self._dbg_frame}) ---"
+                f"\n1. Input   : {avg_pre:.2f} ms"
+                f"\n2. Inference   : {avg_inf:.2f} ms"
+                f"\n3. Output : {avg_out:.2f} ms"
+                f"\n>> TỔNG 1 FRAME : {total:.2f} ms (~ {1000/total:.2f} FPS)"
+            )
+            self._sum_pre = self._sum_inf = self._sum_out = 0.0
 
         return results
 
-    def _decode_and_filter(
-        self,
-        outputs,
-        img_w,
-        img_h,
-        ratio,
-        dw,
-        dh
-    ):
-        box_tensors = [x for x in outputs if len(x.shape) == 4 and x.shape[1] == 64]
+    def _decode_and_filter(self, outputs, img_w, img_h, ratio, dw, dh):
+        if outputs is None:
+            return DetectionResult(None, None)
+
+    
+        box_tensors   = [x for x in outputs if len(x.shape) == 4 and x.shape[1] == 64]
         score_tensors = [x for x in outputs if len(x.shape) == 4 and x.shape[1] != 64]
-        
+
         all_boxes, all_scores = [], []
-        num_classes = max([x.shape[1] for x in score_tensors]) if score_tensors else 80
+        num_classes = max(x.shape[1] for x in score_tensors) if score_tensors else 80
 
         for box_t in box_tensors:
-            H, W = box_t.shape[2], box_t.shape[3]
-            stride = 640 / H
-            
-            cls_cands = [x for x in outputs if x.shape[2] == H and x.shape[3] == W and x.shape[1] == num_classes]
-            if not cls_cands: continue
-            
-            # TỐI ƯU 1: Cắt ngang ma trận, chỉ lấy điểm của Class Người (Tiết kiệm 80x phép tính)
-            cls_t = cls_cands[0][0, self.human_class_id:self.human_class_id+1, :, :].transpose(1, 2, 0)
-            
-            # Giải quyết Anchor Grid Flood (Double Sigmoid)
+            H, W   = box_t.shape[2], box_t.shape[3]
+            stride = _MODEL_INPUT / H  
+
+            cls_cands = [x for x in outputs
+                         if x.shape[2] == H and x.shape[3] == W and x.shape[1] == num_classes]
+            if not cls_cands:
+                continue
+
+            # Chỉ lấy class người — tiết kiệm 80× phép tính 
+            cls_t = cls_cands[0][0, self.human_class_id:self.human_class_id + 1, :, :].transpose(1, 2, 0)
+
             if np.max(cls_t) > 1.0 or np.min(cls_t) < 0.0:
                 cls_t = np.clip(cls_t, -20, 20)
-                cls_t = 1 / (1 + np.exp(-cls_t))
-                
-            # TỐI ƯU 2: Lọc rác trước khi giải mã tọa độ (Tiết kiệm tài nguyên DFL)
+                cls_t = 1.0 / (1.0 + np.exp(-cls_t))
+
             score_mask = cls_t[..., 0] > self.conf_thresh
             if not np.any(score_mask):
                 continue
-                
-            valid_cls = cls_t[score_mask]
-            
+
+            valid_cls  = cls_t[score_mask]
             grid_y, grid_x = np.mgrid[0:H, 0:W]
             valid_grid = np.stack((grid_x, grid_y), axis=-1)[score_mask]
-            
-            b_t = box_t[0].transpose(1, 2, 0).reshape(H, W, 4, 16)
-            valid_b_t = b_t[score_mask]
-            
-            # DFL Box Decoding (Chỉ chạy trên các hộp có khả năng là người)
-            valid_b_t = np.exp(valid_b_t - np.max(valid_b_t, axis=-1, keepdims=True))
-            valid_b_t = valid_b_t / np.sum(valid_b_t, axis=-1, keepdims=True)
-            
-            weights = np.arange(16, dtype=np.float32)
-            dfl_out = np.sum(valid_b_t * weights, axis=-1)
-            
+
+            b_t        = box_t[0].transpose(1, 2, 0).reshape(H, W, 4, 16)
+            valid_b_t  = b_t[score_mask]
+
+            valid_b_t  = np.exp(valid_b_t - np.max(valid_b_t, axis=-1, keepdims=True))
+            valid_b_t /= np.sum(valid_b_t, axis=-1, keepdims=True)
+            dfl_out    = np.sum(valid_b_t * np.arange(16, dtype=np.float32), axis=-1)
+
             lt, rb = dfl_out[..., :2], dfl_out[..., 2:]
-            x1y1 = valid_grid - lt
-            x2y2 = valid_grid + rb
-            
-            cx_cy = (x1y1 + x2y2) / 2 * stride
-            w_h = (x2y2 - x1y1) * stride
-            xywh = np.concatenate((cx_cy, w_h), axis=-1)
-            
+            x1y1   = valid_grid - lt
+            x2y2   = valid_grid + rb
+            cx_cy  = (x1y1 + x2y2) / 2 * stride
+            w_h    = (x2y2 - x1y1) * stride
+            xywh   = np.concatenate((cx_cy, w_h), axis=-1)
+
             all_boxes.append(xywh)
             all_scores.append(valid_cls[..., 0])
 
         if not all_boxes:
             return DetectionResult(None, None)
 
-        boxes = np.concatenate(all_boxes, axis=0)
+        boxes  = np.concatenate(all_boxes,  axis=0)
         scores = np.concatenate(all_scores, axis=0)
 
-        # 4. Scale về kích thước gốc
-        x_scale, y_scale = img_w / 640.0, img_h / 640.0
-        final_boxes = []
-        for cx, cy, w, h in boxes:
+        # xywh → xyxy trong ảnh letterbox, rồi scale về tọa độ gốc (vectorized)
+        cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        x1 = np.clip((cx - w / 2 - dw) / ratio, 0, img_w)
+        y1 = np.clip((cy - h / 2 - dh) / ratio, 0, img_h)
+        x2 = np.clip((cx + w / 2 - dw) / ratio, 0, img_w)
+        y2 = np.clip((cy + h / 2 - dh) / ratio, 0, img_h)
 
-            x1 = cx - w / 2
-            y1 = cy - h / 2
+        # NMS cần xywh (top-left + wh)
+        nms_input = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1)
+        indices   = cv2.dnn.NMSBoxes(
+            nms_input.tolist(), scores.tolist(),
+            self.conf_thresh, self.iou_thresh
+        )
 
-            x2 = cx + w / 2
-            y2 = cy + h / 2
-
-            x1 = (x1 - dw) / ratio
-            y1 = (y1 - dh) / ratio
-
-            x2 = (x2 - dw) / ratio
-            y2 = (y2 - dh) / ratio
-
-            x1 = max(0, min(img_w, x1))
-            y1 = max(0, min(img_h, y1))
-
-            x2 = max(0, min(img_w, x2))
-            y2 = max(0, min(img_h, y2))
-
-            final_boxes.append([
-                int(x1),
-                int(y1),
-                int(x2 - x1),
-                int(y2 - y1)
-            ])
-            
-        pre_nms_count = len(final_boxes)
-
-        indices = cv2.dnn.NMSBoxes(final_boxes, scores.tolist(), self.conf_thresh, self.iou_thresh)
-        
-        if len(indices) == 0:
+        if indices is None or len(indices) == 0:
             return DetectionResult(None, None)
-            
-        nms_xyxy, nms_conf = [], []
-        for i in indices.flatten():
-            x, y, w, h = final_boxes[i]
-            nms_xyxy.append([x, y, x + w, y + h])
-            nms_conf.append(scores[i])
 
-        pre_contain_count = len(nms_xyxy)
+        idx = np.array(indices).flatten()
+        nms_xyxy = np.stack([x1[idx], y1[idx], x2[idx], y2[idx]], axis=1).astype(int).tolist()
+        nms_conf = scores[idx].tolist()
+
         nms_xyxy, nms_conf = _suppress_contained_boxes(nms_xyxy, nms_conf)
-
         if not nms_xyxy:
             return DetectionResult(None, None)
 
-            
-        return DetectionResult(np.array(nms_xyxy), np.array(nms_conf), np.full(len(nms_xyxy), self.human_class_id))
-    def _letterbox(self, img, new_shape=(640, 640)):# resize + pad ảnh về 640×640
+        return DetectionResult(
+            np.array(nms_xyxy),
+            np.array(nms_conf),
+            np.full(len(nms_xyxy), self.human_class_id)
+        )
+
+    def _letterbox(self, img):
         h, w = img.shape[:2]
-
-        r = min(new_shape[0] / h, new_shape[1] / w)
-
+        r  = min(_MODEL_INPUT / h, _MODEL_INPUT / w)
         nw = int(w * r)
         nh = int(h * r)
+        dw = (_MODEL_INPUT - nw) // 2
+        dh = (_MODEL_INPUT - nh) // 2
 
-        resized = cv2.resize(img, (nw, nh))
+        # Tái sử dụng canvas nếu kích thước nguồn không đổi
+        if self._canvas_src != (h, w):
+            self._canvas     = np.full((_MODEL_INPUT, _MODEL_INPUT, 3), 114, dtype=np.uint8)
+            self._canvas_src = (h, w)
 
-        canvas = np.full((640, 640, 3), 114, dtype=np.uint8)
+        self._canvas[dh:dh + nh, dw:dw + nw] = cv2.resize(img, (nw, nh))
+        return self._canvas, r, dw, dh
 
-        dw = (640 - nw) // 2
-        dh = (640 - nh) // 2
-
-        canvas[dh:dh+nh, dw:dw+nw] = resized
-
-        return canvas, r, dw, dh
-        
     def __del__(self):
         if hasattr(self, 'rknn'):
             try:
                 self.rknn.release()
-            except: pass
+            except Exception:
+                pass
 
 
 class RKNNYoloTrackerBuilder:
     def __init__(self):
-        self.model_path = 'yolov8n.rknn'
-        self.confidence = 0.20
-        self.iou = 0.55
+        self.model_path     = 'yolov8n.rknn'
+        self.confidence     = 0.20
+        self.iou            = 0.55
         self.human_class_id = 0
-        self.core_mask = RKNNLite.NPU_CORE_0_1_2
+        self.core_mask      = RKNNLite.NPU_CORE_0_1_2
+        self.async_mode     = False
 
     def set_model_path(self, path):
         self.model_path = path
+        return self
+
+    def set_async_mode(self, enabled):
+        self.async_mode = enabled
         return self
 
     def set_confidence(self, conf):

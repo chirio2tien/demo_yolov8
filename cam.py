@@ -1,84 +1,80 @@
-from src.detector import RKNNYoloTrackerBuilder
-from src.visualizer import (
-    FrameVisualizer,
-    BoundingBoxRenderer,
-    StatusTextRenderer
-)
-
-from src.pipeline import (
-    VideoPipeline,
-    AIDetectorStep,
-    VisualizationStep,
-    DisplayAndSaveStep,
-    WebStreamStep,
-    TelemetryStep
-)
-
-from rknnlite.api import RKNNLite
 import time
+import threading
+from rknnlite.api import RKNNLite
+from src.detector import RKNNYoloTrackerBuilder
+from src.visualizer import FrameVisualizer, BoundingBoxRenderer, StatusTextRenderer
+from src.pipeline import CameraCapturePipeline
+
+
+def build_pipeline(cam_name: str, rtsp_url: str, model_path: str,
+                   web_port: int, npu_core) -> CameraCapturePipeline:
+    #Khởi tạo detector + visualizer rồi đóng gói vào pipeline 3-luồng.
+    print(f"[{cam_name}] Đang khởi tạo Model trên lõi NPU {npu_core}...")
+    t0 = time.perf_counter()
+
+    detector = (
+        RKNNYoloTrackerBuilder()
+        .set_model_path(model_path)
+        .set_confidence(0.20)
+        .set_iou(0.45)
+        .set_core_mask(npu_core)
+        .build()
+    )
+    print(f"[{cam_name}] Init Model: {(time.perf_counter() - t0) * 1000:.2f} ms")
+
+    visualizer = (
+        FrameVisualizer()
+        .add_renderer(BoundingBoxRenderer(font_scale=0.7, thickness=2))
+        .add_renderer(StatusTextRenderer())
+    )
+
+    return CameraCapturePipeline(
+        cam_name=cam_name,
+        rtsp_url=rtsp_url,
+        detector=detector,
+        visualizer=visualizer,
+        web_port=web_port,
+    )
+
+
+def _build_parallel(configs: list) -> list:
+    #Khởi tạo nhiều pipeline song song 
+    results = [None] * len(configs)
+
+    def _init(i, cfg):
+        results[i] = build_pipeline(*cfg)
+
+    threads = [threading.Thread(target=_init, args=(i, cfg), daemon=True)
+               for i, cfg in enumerate(configs)]
+    t0 = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"[main] Tổng thời gian init song song: {(time.perf_counter()-t0)*1000:.0f} ms")
+    return results
 
 
 def main():
+    MODEL_PATH = "yolov8n_416.rknn"
+    cam1_url = "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0"
+    cam2_url = "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0"
 
-    RTSP_URL = "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0"
-    MODEL_PATH = "yolov8n.rknn"
-    OUTPUT_PATH = None
-    WEB_PORT = 5000
+    pipes = _build_parallel([
+        ("CAM 1", cam1_url, MODEL_PATH, 5002, RKNNLite.NPU_CORE_0),
+        ("CAM 2", cam2_url, MODEL_PATH, 5003, RKNNLite.NPU_CORE_1),
+    ])
+
+    for pipe in pipes:
+        pipe.start()
+
     try:
-        print("init model")
-        t_init_start = time.perf_counter()
-
-        detector = (
-            RKNNYoloTrackerBuilder()
-            .set_model_path(MODEL_PATH)
-            .set_confidence(0.20)
-            .set_iou(0.45)
-            .set_core_mask(RKNNLite.NPU_CORE_AUTO)
-            .build()
-        )
-        t_init_end = time.perf_counter()
-        print(f"[PROFILE] Init Model tốn : {(t_init_end - t_init_start) * 1000:.2f} ms")
-
-        visualizer = (
-            FrameVisualizer()
-            .add_renderer(BoundingBoxRenderer(font_scale=0.7,thickness=2))
-            .add_renderer(StatusTextRenderer())
-        )
-
-        pipeline = (
-            VideoPipeline()
-            .add_step(AIDetectorStep(detector))
-            .add_step(TelemetryStep())
-            .add_step(VisualizationStep(visualizer))
-            .add_step(WebStreamStep(port=WEB_PORT))
-            .add_step(DisplayAndSaveStep(
-                display=False,
-                output_path=OUTPUT_PATH,
-                fps=100,
-                size=(1920, 1080)
-            ))
-        )
-
-        print("=" * 60)
-        print("YOLOv8n RKNN Human Detection")
-        print(f"RTSP : {RTSP_URL}")
-        print(f"MODEL: {MODEL_PATH}")
-        print(f"WEB  : http://localhost:{WEB_PORT}")
-        print("=" * 60)
-
-        pipeline.run(
-            RTSP_URL,
-            max_retries=5
-        )
-
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopped by user")
-
-    except Exception as e:
-        print(f"\nCritical Error: {e}")
-
-        import traceback
-        traceback.print_exc()
+        print("\nNgười dùng bấm Ctrl+C. Đang dừng...")
+        for pipe in pipes:
+            pipe.stop()
 
 
 if __name__ == "__main__":
