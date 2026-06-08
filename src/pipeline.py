@@ -10,7 +10,7 @@ from flask import Flask, Response, render_template_string
 logging.basicConfig(level=logging.WARNING)
 
 _GC_INTERVAL = 50
-
+_FRAME_QUEUE_SIZE = 1  # giữ frame mới nhất, tiết kiệm RAM
 
 _STREAM_MAX_WIDTH = 1280
 _STREAM_JPEG_QUALITY = 70
@@ -31,8 +31,9 @@ def _drop_old_and_put(q: queue.Queue, item):
 
 class WebStreamer:
 
-    def __init__(self, port: int = 5000):
+    def __init__(self, port: int = 5000, title: str = "Camera AI Radxa"):
         self.port = port
+        self.title = title
         self.latest_frame = None
         self._lock = threading.Lock()
         self.is_running = True
@@ -41,13 +42,13 @@ class WebStreamer:
 
         @self._app.route('/')
         def index():
-            html = """
+            html = f"""
             <html>
                 <head>
-                    <title>Camera AI Radxa</title>
+                    <title>{title}</title>
                     <style>
-                        body { margin: 0; padding: 0; background-color: #000; overflow: hidden; }
-                        img  { width: 100vw; height: 100vh; object-fit: contain; border: none; }
+                        body {{ margin: 0; padding: 0; background-color: #000; overflow: hidden; }}
+                        img  {{ width: 100vw; height: 100vh; object-fit: contain; border: none; }}
                     </style>
                 </head>
                 <body><img src="/video_feed" /></body>
@@ -64,7 +65,7 @@ class WebStreamer:
 
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
-        print(f" Web Server đang chạy tại: http://localhost:{self.port}")
+        print(f" [{title}] Web Server: http://localhost:{port}")
 
     def _run_server(self):
         self._app.run(
@@ -76,7 +77,6 @@ class WebStreamer:
         )
 
     def _generate(self):
-      
         last_frame = None
         while self.is_running:
             with self._lock:
@@ -123,30 +123,27 @@ class WebStreamer:
 class CameraCapturePipeline:
   
 
-    def __init__(self, cam_name: str, rtsp_url: str, detector, visualizer, web_port: int):
-        self.cam_name  = cam_name
-        self.rtsp_url  = rtsp_url
-        self.detector  = detector
+    def __init__(self, cam_name: str, rtsp_url: str, detector, visualizer,
+                 streamer: WebStreamer):
+        self.cam_name   = cam_name
+        self.rtsp_url   = rtsp_url
+        self.detector   = detector
         self.visualizer = visualizer
+        self.streamer   = streamer
 
-        self.frame_queue  = queue.Queue(maxsize=3)
-        self.result_queue = queue.Queue(maxsize=3)
-
+        self.frame_queue = queue.Queue(maxsize=_FRAME_QUEUE_SIZE)
         self._stop = threading.Event()
-        self.streamer = WebStreamer(port=web_port)
 
     def start(self):
         for target, name in [
-            (self._capture_loop,   f"{self.cam_name}-Capture"),
-            (self._inference_loop, f"{self.cam_name}-Inference"),
-            (self._output_loop,    f"{self.cam_name}-Output"),
+            (self._capture_loop, f"{self.cam_name}-Capture"),
+            (self._process_loop, f"{self.cam_name}-Process"),
         ]:
             threading.Thread(target=target, daemon=True, name=name).start()
-        print(f"[{self.cam_name}] Đã khởi động 3 luồng daemon.")
+        print(f"[{self.cam_name}] Đã khởi động 2 luồng daemon.")
 
     def stop(self):
         self._stop.set()
-        self.streamer.stop()
 
 
     def _capture_loop(self):
@@ -173,7 +170,7 @@ class CameraCapturePipeline:
                 time.sleep(2)
                 continue
 
-            print(f"[{self.cam_name}] RTSP kết nối thành công!")
+            print(f"[{self.cam_name}] [{time.strftime('%H:%M:%S')}] RTSP kết nối thành công!")
             retry = 0
 
             while not self._stop.is_set():
@@ -196,10 +193,9 @@ class CameraCapturePipeline:
 
 
 
-    def _inference_loop(self):
-       
+    def _process_loop(self):
         frame_count = 0
-        fps_times   = []  
+        fps_times   = []
 
         while not self._stop.is_set():
             try:
@@ -208,7 +204,6 @@ class CameraCapturePipeline:
                 continue
 
             frame_count += 1
-
             detection = self.detector.process_frame(frame)
 
             now = time.time()
@@ -225,8 +220,8 @@ class CameraCapturePipeline:
                 'frame_count':    frame_count,
             }
 
-            _drop_old_and_put(self.result_queue, (frame, context))
-
+            frame = self.visualizer.draw(frame, context)
+            self.streamer.update(frame)
             del frame
 
             if frame_count % 30 == 0:
@@ -235,22 +230,4 @@ class CameraCapturePipeline:
             if frame_count % _GC_INTERVAL == 0:
                 gc.collect()
 
-        print(f"[{self.cam_name}] Luồng Inference đã dừng.")
-
-
-
-    def _output_loop(self):
-       
-        while not self._stop.is_set():
-            try:
-                frame, context = self.result_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            frame = self.visualizer.draw(frame, context)
-
-            self.streamer.update(frame)
-
-            del frame
-
-        print(f"[{self.cam_name}] Luồng Output đã dừng.")
+        print(f"[{self.cam_name}] Luồng Process đã dừng.")

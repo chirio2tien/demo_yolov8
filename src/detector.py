@@ -1,10 +1,10 @@
 import cv2
 import time
+import threading
 import numpy as np
 from rknnlite.api import RKNNLite
 
 _DEBUG_TIMING = True
-_MODEL_INPUT = 416
 def _suppress_contained_boxes(xyxy_list, conf_list, contain_ratio=0.7):
     n = len(xyxy_list)
     if n <= 1:
@@ -63,63 +63,85 @@ class RKNNYoloTracker:
         self.human_class_id = builder.human_class_id
         self.core_mask      = builder.core_mask
         self.async_mode     = builder.async_mode
-        self._dbg_frame     = 0
-        self._sum_pre = self._sum_inf = self._sum_out = 0.0
+        self.input_size     = builder.input_size
+        self._local = threading.local()  # per-thread stats + letterbox canvas
+        self._lock  = threading.Lock()
 
-        self._canvas     = None
-        self._canvas_src = None 
-
+        t_rknn = time.perf_counter()
         self.rknn = RKNNLite()
+        print(f"[{time.strftime('%H:%M:%S')}] RKNNLite() constructor: {(time.perf_counter() - t_rknn)*1000:.0f} ms")
         self._initialize_model(builder.model_path)
 
     def _initialize_model(self, model_path: str):
-        print(f"Đang tải RKNN model từ {model_path}...")
+        t0 = time.perf_counter()
+        ts0 = time.strftime('%H:%M:%S')
+        print(f"[{ts0}] Đang tải RKNN model từ {model_path}...")
         if self.rknn.load_rknn(model_path) != 0:
             raise RuntimeError("Lỗi khi load model RKNN!")
+        t_load = time.perf_counter()
+        print(f"[{time.strftime('%H:%M:%S')}] Load model xong: {(t_load - t0)*1000:.0f} ms")
 
-        print(f"Đang khởi tạo NPU (Core Mask: {self.core_mask})...")
+        print(f"[{time.strftime('%H:%M:%S')}] Đang khởi tạo NPU (Core Mask: {self.core_mask})...")
         if self.rknn.init_runtime(core_mask=self.core_mask,
                                    async_mode=self.async_mode) != 0:
             raise RuntimeError("Lỗi khởi tạo NPU Runtime!")
-        print("Khởi tạo NPU thành công!")
+        t_init = time.perf_counter()
+        print(
+            f"[{time.strftime('%H:%M:%S')}] Init NPU xong: {(t_init - t_load)*1000:.0f} ms"
+            f" | Tổng khởi tạo model: {(t_init - t0)*1000:.0f} ms"
+        )
+
+        dummy = np.zeros((1, self.input_size, self.input_size, 3), dtype=np.uint8)
+        t_warm = time.perf_counter()
+        self.rknn.inference(inputs=[dummy])
+        print(f"[{time.strftime('%H:%M:%S')}] Warm-up inference: {(time.perf_counter() - t_warm)*1000:.0f} ms")
+
+    def _get_local(self):
+        loc = self._local
+        if not hasattr(loc, 'frame'):
+            loc.frame = 0
+            loc.sum_pre = loc.sum_inf = loc.sum_out = 0.0
+            loc.cam_name = threading.current_thread().name
+        return loc
 
     def process_frame(self, frame):
-        self._dbg_frame += 1
+        loc = self._get_local()
+        loc.frame += 1
         img_h, img_w = frame.shape[:2]
 
-        # In độ phân giải nguồn 
-        if self._dbg_frame == 1:
-            print(f"[detector] Độ phân giải nguồn camera: {img_w}x{img_h}")
+        if loc.frame == 1:
+            print(f"[{loc.cam_name}] Độ phân giải nguồn camera: {img_w}x{img_h}")
 
         start_input = time.perf_counter()
         img_input, ratio, dw, dh = self._letterbox(frame)
         img_expanded = np.expand_dims(img_input, axis=0)
         end_input = time.perf_counter()
-        self._sum_pre += end_input - start_input
+        loc.sum_pre += end_input - start_input
 
         start_predict = time.perf_counter()
-        outputs = self.rknn.inference(inputs=[img_expanded])
+        with self._lock:
+            outputs = self.rknn.inference(inputs=[img_expanded])
         end_predict = time.perf_counter()
-        self._sum_inf += end_predict - start_predict
+        loc.sum_inf += end_predict - start_predict
 
         start_output = time.perf_counter()
         results = self._decode_and_filter(outputs, img_w, img_h, ratio, dw, dh)
         end_output = time.perf_counter()
-        self._sum_out += end_output - start_output
+        loc.sum_out += end_output - start_output
 
-        if _DEBUG_TIMING and self._dbg_frame % 30 == 0:
-            avg_pre = self._sum_pre / 30 * 1000
-            avg_inf = self._sum_inf / 30 * 1000
-            avg_out = self._sum_out / 30 * 1000
+        if _DEBUG_TIMING and loc.frame % 30 == 0:
+            avg_pre = loc.sum_pre / 30 * 1000
+            avg_inf = loc.sum_inf / 30 * 1000
+            avg_out = loc.sum_out / 30 * 1000
             total   = avg_pre + avg_inf + avg_out
             print(
-                f"\n--- THỐNG KÊ 30 FRAME (Tới frame {self._dbg_frame}) ---"
-                f"\n1. Input   : {avg_pre:.2f} ms"
-                f"\n2. Inference   : {avg_inf:.2f} ms"
-                f"\n3. Output : {avg_out:.2f} ms"
-                f"\n>> TỔNG 1 FRAME : {total:.2f} ms (~ {1000/total:.2f} FPS)"
+                f"\n--- [{loc.cam_name}] 30 FRAME (frame {loc.frame}) ---"
+                f"\n1. Input     : {avg_pre:.2f} ms"
+                f"\n2. Inference : {avg_inf:.2f} ms"
+                f"\n3. Output    : {avg_out:.2f} ms"
+                f"\n>> TỔNG      : {total:.2f} ms (~{1000/total:.1f} FPS)"
             )
-            self._sum_pre = self._sum_inf = self._sum_out = 0.0
+            loc.sum_pre = loc.sum_inf = loc.sum_out = 0.0
 
         return results
 
@@ -136,7 +158,7 @@ class RKNNYoloTracker:
 
         for box_t in box_tensors:
             H, W   = box_t.shape[2], box_t.shape[3]
-            stride = _MODEL_INPUT / H  
+            stride = self.input_size / H  
 
             cls_cands = [x for x in outputs
                          if x.shape[2] == H and x.shape[3] == W and x.shape[1] == num_classes]
@@ -214,19 +236,19 @@ class RKNNYoloTracker:
 
     def _letterbox(self, img):
         h, w = img.shape[:2]
-        r  = min(_MODEL_INPUT / h, _MODEL_INPUT / w)
+        r  = min(self.input_size / h, self.input_size / w)
         nw = int(w * r)
         nh = int(h * r)
-        dw = (_MODEL_INPUT - nw) // 2
-        dh = (_MODEL_INPUT - nh) // 2
+        dw = (self.input_size - nw) // 2
+        dh = (self.input_size - nh) // 2
 
-        # Tái sử dụng canvas nếu kích thước nguồn không đổi
-        if self._canvas_src != (h, w):
-            self._canvas     = np.full((_MODEL_INPUT, _MODEL_INPUT, 3), 114, dtype=np.uint8)
-            self._canvas_src = (h, w)
+        loc = self._get_local()
+        if getattr(loc, 'canvas_src', None) != (h, w):
+            loc.canvas     = np.full((self.input_size, self.input_size, 3), 114, dtype=np.uint8)
+            loc.canvas_src = (h, w)
 
-        self._canvas[dh:dh + nh, dw:dw + nw] = cv2.resize(img, (nw, nh))
-        return self._canvas, r, dw, dh
+        loc.canvas[dh:dh + nh, dw:dw + nw] = cv2.resize(img, (nw, nh))
+        return loc.canvas, r, dw, dh
 
     def __del__(self):
         if hasattr(self, 'rknn'):
@@ -244,6 +266,7 @@ class RKNNYoloTrackerBuilder:
         self.human_class_id = 0
         self.core_mask      = RKNNLite.NPU_CORE_0_1_2
         self.async_mode     = False
+        self.input_size     = 640
 
     def set_model_path(self, path):
         self.model_path = path
@@ -263,6 +286,10 @@ class RKNNYoloTrackerBuilder:
 
     def set_core_mask(self, core_mask):
         self.core_mask = core_mask
+        return self
+
+    def set_input_size(self, size: int):
+        self.input_size = size
         return self
 
     def build(self) -> RKNNYoloTracker:

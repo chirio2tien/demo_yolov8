@@ -143,15 +143,13 @@ class StatusTextRenderer(BaseRenderer):
             else 0
         )
 
-        fps = context_data.get(
-            "current_fps",
-            0.0
-        )
+        show_fps  = context_data.get("current_fps", 0.0)
+        infer_fps = context_data.get("infer_fps")
 
-        text = (
-            f"Target: {num_targets} | "
-            f"FPS: {fps:.1f}"
-        )
+        if infer_fps is not None:
+            text = f"Target: {num_targets} | Show: {show_fps:.0f} | Infer: {infer_fps:.0f}"
+        else:
+            text = f"Target: {num_targets} | FPS: {show_fps:.1f}"
 
         x, y = self.position
 
