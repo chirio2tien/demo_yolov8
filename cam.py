@@ -6,6 +6,9 @@ from multiprocessing import Process, Queue, Event
 from src.pipeline import WebStreamer
 from src.visualizer import FrameVisualizer, BoundingBoxRenderer, StatusTextRenderer
 from src.frame_buffer import SharedFrameBuffer
+from src.config import (
+    ENABLE_WEB_STREAM, CAPTURE_MAX_WIDTH, CAPTURE_FRAME_SKIP, shm_dimensions,
+)
 from src.model_pool import build_model_slots, cam_to_infer_queue, MAX_CAMS_PER_MODEL
 from src.workers import capture_worker, inference_worker
 
@@ -48,7 +51,8 @@ def _infer_cache_loop(infer_out_q: Queue, detection_cache: dict,
             }
 
         if state['count'] % 30 == 0:
-            print(f"[{cam_name}] Infer FPS: {fps:.1f}")
+            n = len(detection) if detection else 0
+            print(f"[{cam_name}] Infer FPS: {fps:.1f} | detections: {n}")
 
 
 def _display_loop(stream_id: str, cam_name: str, frame_buffer: SharedFrameBuffer,
@@ -111,6 +115,12 @@ def main():
          "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0", 5003),
          ("CAM 3", "cam3",
          "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0", 5004),
+         ("CAM 4", "cam4",
+         "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0", 5005),
+        ("CAM 5", "cam5",
+         "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0", 5006),
+         ("CAM 6", "cam6",
+         "rtsp://192.168.105.18:8554/b8aa7044-6780-798b-d0d6-0e617d223e69_0", 5007),
     ]
 
     stop_event = Event()
@@ -121,18 +131,18 @@ def main():
     slots = build_model_slots(CAMERAS, _QUEUE_SIZE)
     cam_infer_q = cam_to_infer_queue(slots)
 
+    shm_max_h, shm_max_w = shm_dimensions(CAPTURE_MAX_WIDTH)
     frame_buffers = {
-        stream_id: SharedFrameBuffer(name=stream_id)
+        stream_id: SharedFrameBuffer(name=stream_id, max_h=shm_max_h, max_w=shm_max_w)
         for _, stream_id, _, _ in CAMERAS
     }
-    shm_names = {sid: buf.shm_name for sid, buf in frame_buffers.items()}
+    # (shm_name, max_h, max_w) — process con phải dùng cùng kích thước khi attach
+    shm_info = {
+        sid: (buf.shm_name, shm_max_h, shm_max_w)
+        for sid, buf in frame_buffers.items()
+    }
 
     streamers = {}
-    visualizers = {}
-    for cam_name, stream_id, _, port in CAMERAS:
-        streamers[stream_id] = WebStreamer(port=port, title=cam_name)
-        visualizers[stream_id] = _build_visualizer()
-
     threading.Thread(
         target=_infer_cache_loop,
         args=(infer_out_q, detection_cache, cache_lock, stop_event),
@@ -140,19 +150,26 @@ def main():
         name="InferCache",
     ).start()
 
-    for cam_name, stream_id, _, _ in CAMERAS:
-        threading.Thread(
-            target=_display_loop,
-            args=(stream_id, cam_name, frame_buffers[stream_id],
-                  streamers[stream_id], visualizers[stream_id],
-                  detection_cache, cache_lock, stop_event),
-            daemon=True,
-            name=f"{cam_name}-Display",
-        ).start()
+    if ENABLE_WEB_STREAM:
+        visualizers = {}
+        for cam_name, stream_id, _, port in CAMERAS:
+            streamers[stream_id] = WebStreamer(port=port, title=cam_name)
+            visualizers[stream_id] = _build_visualizer()
+        for cam_name, stream_id, _, _ in CAMERAS:
+            threading.Thread(
+                target=_display_loop,
+                args=(stream_id, cam_name, frame_buffers[stream_id],
+                      streamers[stream_id], visualizers[stream_id],
+                      detection_cache, cache_lock, stop_event),
+                daemon=True,
+                name=f"{cam_name}-Display",
+            ).start()
+    else:
+        print("[main] Web stream TẮT — chỉ capture + infer (xem log Infer FPS)")
 
     processes = []
     for slot in slots:
-        worker_shm = {sid: shm_names[sid] for sid in slot['stream_ids']}
+        worker_shm = {sid: shm_info[sid] for sid in slot['stream_ids']}
         cam_names = ', '.join(entry[0] for entry in slot['cameras'])
         print(
             f"[main] {slot['label']} | {MODEL_PATH} | core={slot['npu_core']} "
@@ -171,14 +188,16 @@ def main():
         processes.append(Process(
             target=capture_worker,
             args=(cam_name, rtsp_url, stream_id,
-                  shm_names[stream_id], cam_infer_q[stream_id], stop_event),
+                  shm_info[stream_id], cam_infer_q[stream_id], stop_event,
+                  CAPTURE_MAX_WIDTH, CAPTURE_FRAME_SKIP),
             name=f"{cam_name}-Capture",
             daemon=True,
         ))
 
     print(
         f"[main] Model pool: {len(slots)} instance(s), "
-        f"{len(CAMERAS)} cam, max {MAX_CAMS_PER_MODEL} cam/model"
+        f"{len(CAMERAS)} cam, max {MAX_CAMS_PER_MODEL} cam/model | "
+        f"max_w={shm_max_w}, frame_skip={CAPTURE_FRAME_SKIP}, web={ENABLE_WEB_STREAM}"
     )
     for proc in processes:
         proc.start()
@@ -191,8 +210,9 @@ def main():
         stop_event.set()
         for proc in processes:
             proc.join(timeout=5)
-        for s in streamers.values():
-            s.stop()
+        if ENABLE_WEB_STREAM:
+            for s in streamers.values():
+                s.stop()
         for buf in frame_buffers.values():
             buf.close()
             buf.unlink()

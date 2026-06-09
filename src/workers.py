@@ -30,10 +30,23 @@ def _notify(q: Queue, item):
         pass
 
 
+def _maybe_downscale(frame, max_width: int):
+    if max_width <= 0:
+        return frame
+    h, w = frame.shape[:2]
+    if w <= max_width:
+        return frame
+    scale = max_width / w
+    return cv2.resize(frame, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+
 def capture_worker(cam_name: str, rtsp_url: str, stream_id: str,
-                   shm_name: str, infer_in_q: Queue, stop_event):
+                   shm_info: tuple, infer_in_q: Queue, stop_event,
+                   capture_max_width: int = 0, frame_skip: int = 1):
     """Process riêng: decode RTSP, ghi frame vào shared memory."""
-    frame_buf = attach_frame_buffer(shm_name)
+    shm_name, shm_max_h, shm_max_w = shm_info
+    frame_buf = attach_frame_buffer(shm_name, shm_max_h, shm_max_w)
+    frame_skip = max(1, frame_skip)
     retry, max_retries = 0, 10
 
     try:
@@ -52,12 +65,23 @@ def capture_worker(cam_name: str, rtsp_url: str, stream_id: str,
             retry = 0
 
             while not stop_event.is_set():
+                ok = True
+                for _ in range(frame_skip - 1):
+                    if not cap.grab():
+                        ok = False
+                        break
+                if not ok:
+                    print(f"[{cam_name}] Mất kết nối, đang kết nối lại...")
+                    retry += 1
+                    break
+
                 ret, frame = cap.read()
                 if not ret:
                     print(f"[{cam_name}] Mất kết nối, đang kết nối lại...")
                     retry += 1
                     break
 
+                frame = _maybe_downscale(frame, capture_max_width)
                 frame_buf.write(frame)
                 _notify(infer_in_q, (stream_id, cam_name))
                 del frame
@@ -74,7 +98,10 @@ def inference_worker(model_path: str, model_input_size: int, core_mask,
                      shm_names: dict, infer_in_q: Queue,
                      infer_out_q: Queue, stop_event, worker_name: str = "inference"):
     """Process riêng: load 1 model trên 1 NPU core, đọc frame từ shared memory."""
-    frame_bufs = {sid: attach_frame_buffer(name) for sid, name in shm_names.items()}
+    frame_bufs = {
+        sid: attach_frame_buffer(name, max_h, max_w)
+        for sid, (name, max_h, max_w) in shm_names.items()
+    }
 
     print(f"[{worker_name}] Load {model_path} {model_input_size}x{model_input_size} (core={core_mask})...")
     t0 = time.perf_counter()

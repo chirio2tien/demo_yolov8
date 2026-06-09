@@ -1,10 +1,7 @@
 from multiprocessing import Queue
 
 from rknnlite.api import RKNNLite
-
-# 416 ~15ms/frame → ~65 infer/s. Mục tiêu ~15 FPS infer/cam → tối đa ~4 cam/model.
-# Đặt 2 để mỗi cam infer ổn định; cam thứ 3+ tự load model mới.
-MAX_CAMS_PER_MODEL = 2
+from src.config import MAX_CAMS_PER_MODEL
 
 NPU_CORES = [
     RKNNLite.NPU_CORE_0,
